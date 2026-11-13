@@ -1,0 +1,34 @@
+// ĐỀ XUẤT – CHƯA KIỂM THỬ – KHÔNG DEPLOY khi chưa thử với Emulator và app Android.
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function myRole() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role; }
+    function isMod() { return signedIn() && myRole() == 'moderator'; }
+
+    match /users/{uid} {
+      allow read: if signedIn();
+      // Theo quyết định của chủ dự án: đăng ký tự do mọi vai trò (như Android). Chỉ chặn tự gắn dấu xác minh.
+      allow create: if signedIn() && request.auth.uid == uid && request.resource.data.isVerified == false;
+      allow update: if signedIn() && (
+        isMod() ||
+        (request.auth.uid == uid
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.isVerified == resource.data.isVerified
+          && (request.resource.data.verificationStatus == resource.data.verificationStatus
+              || request.resource.data.verificationStatus == 'pending')));
+      allow delete: if false;
+    }
+
+    // Thông báo: ai đăng nhập cũng đọc được; chỉ vai trò publisher được đăng/sửa/xóa.
+    match /announcements/{id} {
+      allow read: if signedIn();
+      allow write: if signedIn() && myRole() == 'publisher';
+    }
+
+    // Giữ nguyên hành vi hiện tại cho mọi collection khác (Giai đoạn 1).
+    match /{col}/{doc=**} {
+      allow read, write: if signedIn() && col != 'users' && col != 'announcements';
+    }
+  }
+}

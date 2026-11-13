@@ -1,0 +1,65 @@
+// ĐỀ XUẤT – CHƯA KIỂM THỬ. KHÔNG deploy khi chưa thử với Firebase Emulator VÀ với app Android (có thể làm Android bị từ chối ghi).
+// Thay thế firestore.rules.stage1.proposed. Giả định: hàm Vercel đã cấp Custom Claims { pub, pubExp } cho Nhà phát hành.
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function isPub() { return signedIn() && request.auth.token.pub == true && request.auth.token.pubExp > request.time.toMillis(); }
+    function isMod() { return signedIn() && me().role == 'moderator'; }
+    function staff() { return isPub() || isMod(); }
+    // Đình chỉ/cấm còn hiệu lực → chặn mọi ghi. Hạn chế theo phạm vi → chặn ghi nội dung tương ứng.
+    function sanc() { return me().get('sanction', null); }
+    function live(s) { return s != null && (s.get('until', null) == null || s.until > request.time.toMillis()); }
+    function blocked() { let s = sanc(); return live(s) && s.type in ['SUSPEND', 'BAN']; }
+    function restricted(scope) { let s = sanc(); return live(s) && s.type == 'RESTRICT' && s.get('scope', 'ALL') in [scope, 'ALL']; }
+    function canWrite(scope) { return signedIn() && !blocked() && !restricted(scope); }
+
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.auth.uid == uid && request.resource.data.get('isVerified', false) == false && !('sanction' in request.resource.data);
+      allow update: if isPub()
+        || (signedIn() && request.auth.uid == uid && !blocked()
+            && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'isVerified', 'accountStatus', 'sanction', 'deletedAt'])
+            && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['verificationStatus']) || request.resource.data.verificationStatus == 'pending'))
+        || (isMod() && request.resource.data.diff(resource.data).affectedKeys().hasOnly([]));
+      allow delete: if false;
+      // Dữ liệu cá nhân (nhật ký, ghi chú, mục tiêu…) chỉ chủ tài khoản truy cập.
+      match /{sub}/{d} { allow read, write: if signedIn() && request.auth.uid == uid; }
+    }
+    match /publisher_profiles/{uid} { allow read: if signedIn(); allow write: if isPub() && request.auth.uid == uid; }
+    match /announcements/{id} { allow read: if signedIn(); allow write: if isPub(); }
+
+    match /empathy_posts/{postId} {
+      allow read: if signedIn();
+      allow create: if canWrite('POST') && request.resource.data.authorId == request.auth.uid;
+      allow update: if staff()
+        || (signedIn() && !blocked() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['empathyCount', 'commentCount', 'reportCount']));
+      allow delete: if staff() || (signedIn() && resource.data.authorId == request.auth.uid);
+      match /comments/{cid} {
+        allow read: if signedIn();
+        allow create: if canWrite('COMMENT') && request.resource.data.authorId == request.auth.uid;
+        allow update: if staff() || (signedIn() && !blocked() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['empathyCount']));
+        allow delete: if staff() || (signedIn() && resource.data.authorId == request.auth.uid);
+      }
+    }
+    // Báo cáo: người dùng chỉ TẠO (id = uid_targetId nên không trùng); chỉ staff đọc/cập nhật; người báo cáo đọc được báo cáo của mình.
+    match /reports/{rid} {
+      allow create: if canWrite('POST') && request.resource.data.reporterId == request.auth.uid && request.resource.data.status == 'PENDING';
+      allow read: if staff() || (signedIn() && resource.data.reporterId == request.auth.uid);
+      allow update: if staff();
+      allow delete: if false;
+    }
+    match /moderation_logs/{id} { allow read: if staff(); allow create: if staff() && request.resource.data.actorUid == request.auth.uid; allow update, delete: if false; }
+    match /moderation_actions/{id} { allow read: if staff(); allow create: if isPub() || (isMod() && request.resource.data.action == 'PROPOSAL'); allow update, delete: if false; }
+    match /verificationRequests/{id} { allow create: if signedIn() && request.resource.data.uid == request.auth.uid; allow read: if staff() || (signedIn() && resource.data.uid == request.auth.uid); allow update: if isPub(); allow delete: if false; }
+    match /supportRequests/{id} { allow create: if signedIn() && request.resource.data.uid == request.auth.uid; allow read: if staff() || (signedIn() && resource.data.uid == request.auth.uid); allow update, delete: if staff(); }
+    match /publisher_attempts/{id} { allow read, write: if false; }   // chỉ máy chủ (Admin SDK)
+
+    // Các collection còn lại giữ như hiện tại (đã đăng nhập). exams/questions vẫn lộ đáp án — xem docs/SECURITY.md.
+    match /{col}/{doc=**} {
+      allow read, write: if signedIn() && !blocked()
+        && !(col in ['users', 'empathy_posts', 'reports', 'moderation_logs', 'moderation_actions', 'verificationRequests', 'supportRequests', 'publisher_profiles', 'publisher_attempts', 'announcements']);
+    }
+  }
+}
